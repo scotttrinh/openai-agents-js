@@ -1,10 +1,4 @@
 import { UserError } from '@openai/agents-core';
-import { existsSync, readFileSync } from 'node:fs';
-import {
-  dirname as pathDirname,
-  join as pathJoin,
-  resolve as pathResolve,
-} from 'node:path';
 import {
   Manifest,
   SandboxLifecycleError,
@@ -56,7 +50,6 @@ type VercelSdkSandbox = import('@vercel/sandbox').Sandbox;
 type VercelSdkCreateParams = Parameters<VercelSdkSandboxClass['create']>[0];
 type VercelSdkGetParams = Parameters<VercelSdkSandboxClass['get']>[0];
 type VercelSdkRunCommandParams = Parameters<VercelSdkSandbox['runCommand']>[0];
-type VercelAuthModule = typeof import('@vercel/sandbox/dist/auth/index.js');
 
 type VercelSandboxCreateParams = Record<string, unknown> & {
   source?:
@@ -107,7 +100,6 @@ type VercelCredentials = Pick<
   VercelSandboxClientOptions,
   'projectId' | 'teamId' | 'token'
 >;
-type VercelAuth = NonNullable<ReturnType<VercelAuthModule['getAuth']>>;
 
 type VercelSandboxInstance = {
   sandboxId: string;
@@ -782,7 +774,7 @@ export class VercelSandboxClient implements SandboxClient<
 
         const session = new VercelSandboxSession({
           sandbox,
-          credentials: { ...resolvedOptions, ...credentials },
+          credentials,
           concurrencyLimits: createArgs.concurrencyLimits,
           archiveLimits: createArgs.archiveLimits,
           state: {
@@ -1089,9 +1081,9 @@ function pickVercelCredentials(
   return credentials;
 }
 
-async function resolveVercelCredentials(
+function resolveVercelCredentials(
   options: VercelCredentials,
-): Promise<Record<string, string>> {
+): Record<string, string> {
   const envOptions = {
     projectId: process.env.VERCEL_PROJECT_ID,
     teamId: process.env.VERCEL_TEAM_ID,
@@ -1102,138 +1094,11 @@ async function resolveVercelCredentials(
     teamId: options.teamId ?? envOptions.teamId,
     token: options.token ?? envOptions.token,
   });
-  if (layeredCredentials.token) {
-    const refreshedCredentials =
-      await refreshLayeredVercelCliCredentials(layeredCredentials);
-    if (refreshedCredentials === null) {
-      const { token: _token, ...credentialsWithoutToken } = layeredCredentials;
-      void _token;
-      return credentialsWithoutToken;
-    }
-    return refreshedCredentials ?? layeredCredentials;
-  }
-
-  if (Object.keys(layeredCredentials).length > 0) {
-    const cliToken = await resolveVercelCliAuthToken();
-    if (cliToken) {
-      return {
-        ...layeredCredentials,
-        token: cliToken,
-      };
-    }
-    return {};
-  }
-
-  if (hasAnyVercelCredentialOption(options)) {
-    return {};
-  }
-
-  return (await resolveVercelCliCredentials()) ?? {};
-}
-
-function hasAnyVercelCredentialOption(options: VercelCredentials): boolean {
-  return Boolean(options.projectId || options.teamId || options.token);
-}
-
-async function resolveVercelCliCredentials(): Promise<
-  Record<string, string> | undefined
-> {
-  const token = await resolveVercelCliAuthToken();
-  if (!token) {
-    return undefined;
-  }
-
-  const linkedProject = findLinkedVercelProject();
-  if (!linkedProject) {
-    return { token };
-  }
-
-  return {
-    token,
-    projectId: linkedProject.projectId,
-    teamId: linkedProject.teamId,
-  };
-}
-
-async function resolveVercelCliAuthToken(): Promise<string | undefined> {
-  const authModule = await loadVercelAuthModule();
-  if (!authModule) {
-    return undefined;
-  }
-
-  const auth = await resolveVercelCliAuth(authModule);
-  return auth?.token;
-}
-
-async function refreshLayeredVercelCliCredentials(
-  credentials: Record<string, string>,
-): Promise<Record<string, string> | null | undefined> {
-  if (!credentials.token) {
-    return undefined;
-  }
-
-  const authModule = await loadVercelAuthModule();
-  if (!authModule) {
-    return undefined;
-  }
-
-  const auth = authModule.getAuth();
-  if (!auth?.token || auth.token !== credentials.token) {
-    return undefined;
-  }
-
-  const resolvedAuth = await resolveVercelCliAuth(authModule, auth);
-  if (!resolvedAuth?.token) {
-    return null;
-  }
-
-  return {
-    ...credentials,
-    token: resolvedAuth.token,
-  };
-}
-
-async function loadVercelAuthModule(): Promise<VercelAuthModule | undefined> {
-  if (process.env.NODE_ENV === 'test' && !process.env.VERCEL_AUTH_CONFIG_DIR) {
-    return undefined;
-  }
-
-  try {
-    return await import('@vercel/sandbox/dist/auth/index.js');
-  } catch {
-    return undefined;
-  }
-}
-
-async function resolveVercelCliAuth(
-  authModule: VercelAuthModule,
-  initialAuth = authModule.getAuth(),
-): Promise<VercelAuth | undefined> {
-  let auth = initialAuth;
-  if (!auth?.token && !auth?.refreshToken) {
-    return undefined;
-  }
-
-  if (auth?.expiresAt && auth.expiresAt.getTime() <= Date.now()) {
-    if (!auth.refreshToken) {
-      return undefined;
-    }
-    const refreshed = await (
-      await authModule.OAuth()
-    ).refreshToken(auth.refreshToken);
-    auth = {
-      expiresAt: new Date(Date.now() + refreshed.expires_in * 1_000),
-      token: refreshed.access_token,
-      refreshToken: refreshed.refresh_token ?? auth.refreshToken,
-    };
-    try {
-      authModule.updateAuthConfig(auth);
-    } catch {
-      // The refreshed token is still usable for this process.
-    }
-  }
-
-  return auth ?? undefined;
+  return layeredCredentials.token &&
+    layeredCredentials.projectId &&
+    layeredCredentials.teamId
+    ? layeredCredentials
+    : {};
 }
 
 function applyResolvedVercelCredentials(
@@ -1250,57 +1115,6 @@ function applyResolvedVercelCredentials(
     state.token = credentials.token;
   } else {
     delete state.token;
-  }
-}
-
-function findLinkedVercelProject():
-  | { projectId: string; teamId: string }
-  | undefined {
-  const candidateCwds = [
-    process.env.INIT_CWD,
-    process.env.PWD,
-    process.cwd(),
-  ].filter((value): value is string => Boolean(value));
-
-  for (const cwd of candidateCwds) {
-    const projectPath = findUpVercelProjectFile(cwd);
-    if (!projectPath) {
-      continue;
-    }
-    try {
-      const data = JSON.parse(readFileSync(projectPath, 'utf8')) as Record<
-        string,
-        unknown
-      >;
-      if (
-        typeof data.projectId === 'string' &&
-        typeof data.orgId === 'string'
-      ) {
-        return {
-          projectId: data.projectId,
-          teamId: data.orgId,
-        };
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return undefined;
-}
-
-function findUpVercelProjectFile(startDir: string): string | undefined {
-  let current = pathResolve(startDir);
-  while (true) {
-    const candidate = pathJoin(current, '.vercel', 'project.json');
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-    const parent = pathDirname(current);
-    if (parent === current) {
-      return undefined;
-    }
-    current = parent;
   }
 }
 
